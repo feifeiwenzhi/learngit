@@ -74,54 +74,60 @@ class GrowingGenerator(nn.Module):
                                                            or opt.train_mode == "animation" \
                                                         else nn.ZeroPad2d(opt.num_layer)
 
-        self.head = ConvBlock(3, N, opt.ker_size, opt.padd_size, opt, generator=True) # 3 opt.nc_im
+        # self.head = ConvBlock(3, N, opt.ker_size, opt.padd_size, opt, generator=True) # 3 opt.nc_im
 
         self.body = torch.nn.ModuleList([])
+        head = ConvBlock(opt.nc_im, N, opt.ker_size, opt.padd_size, opt, generator=True)
         _first_stage = nn.Sequential()
+        _first_stage.add_module('head', head)
         for i in range(opt.num_layer):
             block = ConvBlock(N, N, opt.ker_size, opt.padd_size, opt, generator=True)
             _first_stage.add_module('block%d'%(i),block)
+        self.tail = nn.Sequential(
+            nn.Conv2d(N, opt.nc_im, kernel_size=opt.ker_size, padding=opt.padd_size),
+            nn.Tanh())
+        # _first_stage.add_module('tail', tail)
         self.body.append(_first_stage)
 
         self.tail = nn.Sequential(
             nn.Conv2d(N, opt.nc_im, kernel_size=opt.ker_size, padding=opt.padd_size),
             nn.Tanh())
-
+        N2 = self.opt.nfc2
+        self.head2 = ConvBlock(opt.nc_im*3, N2, opt.ker_size, opt.padd_size, opt, generator=True)
+        self.body2 = nn.Sequential()
+        for i in range(2):
+            N2 = int(opt.nfc2/pow(2,(i+1)))
+            block = ConvBlock(max(2*N2, opt.min_nfc2), max(N2, opt.min_nfc2), opt.ker_size, opt.padd_size, opt, generator=True)
+            self.body2.add_module('block%d'%(i),block)
         self.tail2 = nn.Sequential(
-            nn.Conv2d(N, N, kernel_size=opt.ker_size, padding=opt.padd_size),
-            nn.Tanh())
+            nn.Conv2d(max(N2, opt.min_nfc2), opt.nc_im, kernel_size=opt.ker_size, stride =1, padding=opt.padd_size),
+            nn.Sigmoid()
+        )
 
     def init_next_stage(self):
         self.body.append(copy.deepcopy(self.body[-1]))
 
-    def forward(self, img, noise, real_shapes, noise_amp, add_noise=False):
-        x = self.head(self._pad(img[0]))
-
-        # we do some upsampling for training models for unconditional generation to increase
-        # the image diversity at the edges of generated images
-        if self.opt.train_mode == "generation" or self.opt.train_mode == "animation":
-            x = upsample(x, size=[x.shape[2] + 2, x.shape[3] + 2])
-        x = self._pad_block(x)
-        x_prev_out = self.body[0](x)
-
-        for idx, block in enumerate(self.body[1:], 1):
-            if self.opt.train_mode == "generation" or self.opt.train_mode == "animation":
+    def forward(self, noise, pre_noise, real_shapes):
+        for idx, block in enumerate(self.body):
+            if idx == 0:
+                x_prev_out = self._pad(noise[0])
+                x_prev_out = upsample(x_prev_out, size=[x_prev_out.shape[2] + self.opt.num_layer*2,
+                                                      x_prev_out.shape[3] + self.opt.num_layer*2])
+                x_prev_out = block(x_prev_out)
+            else:
                 x_prev_out_1 = upsample(x_prev_out, size=[real_shapes[idx][2], real_shapes[idx][3]])
                 x_prev_out_2 = upsample(x_prev_out, size=[real_shapes[idx][2] + self.opt.num_layer*2,
                                                           real_shapes[idx][3] + self.opt.num_layer*2])
-                # noise_ = upsample(noise[idx], size=[real_shapes[idx][2] + self.opt.num_layer*2,
-                #                                           real_shapes[idx][3] + self.opt.num_layer*2])
-                x_prev = block(x_prev_out_2 + img[idx] * noise_amp[idx]) # noise_ * noise_amp[idx]
-            else:
-                x_prev_out_1 = upsample(x_prev_out, size=real_shapes[idx][2:])
-                x_prev = block(self._pad_block(x_prev_out_1+noise[idx]*noise_amp[idx]))
-            x_prev_out = x_prev + x_prev_out_1
+                noise_index = block[0](self._pad(noise[idx]))
+                noise_index = upsample(noise_index, size=[real_shapes[idx][2] + self.opt.num_layer*2, real_shapes[idx][3] + self.opt.num_layer*2])
+                x_prev = block[1:](x_prev_out_2 + noise_index)  # noise_ * noise_amp[idx]
+                x_prev_out = x_prev + x_prev_out_1
 
-        x_prev_out = self.tail(x_prev_out)
-        ind = int((noise.shape[2] - noise.shape[2])/2)
-        noise = noise[:,:,ind:(noise.shape[2]-ind),ind:(noise.shape[3]-ind)]
-        return x_prev_out + noise
+        noise_out = self.tail(self._pad(x_prev_out))
+        x_c = torch.cat((noise[-1], pre_noise, noise_out), 1)
 
-        # out = self.tail(self._pad(x_prev_out))
-        # out2 = self.tail2(self._pad(x_prev_out))
-        # return out, out2
+        a1 = self.head2(self._pad(x_c))
+        a1 = upsample(a1, size=[a1.shape[2] + self.opt.num_layer*2, a1.shape[3] + self.opt.num_layer*2])
+        a1 = self.body2(a1)
+        a1 = self.tail2(a1)
+        return a1 * noise_out + (1 - a1) * pre_noise
